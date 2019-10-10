@@ -177,6 +177,7 @@ WEBVIEW_API void webview_print_log(const char *s);
 
 WEBVIEW_API int webview(const char *title, const char *url, int width,
                         int height, int resizable) {
+  int r;
   struct webview webview;
   memset(&webview, 0, sizeof(webview));
   webview.title = title;
@@ -184,7 +185,7 @@ WEBVIEW_API int webview(const char *title, const char *url, int width,
   webview.width = width;
   webview.height = height;
   webview.resizable = resizable;
-  int r = webview_init(&webview);
+  r = webview_init(&webview);
   if (r != 0) {
     return r;
   }
@@ -226,16 +227,18 @@ static int webview_js_encode(const char *s, char *esc, size_t n) {
 }
 
 WEBVIEW_API int webview_inject_css(struct webview *w, const char *css) {
+  char *js;
+  int r;
   int n = webview_js_encode(css, NULL, 0);
   char *esc = (char *)calloc(1, sizeof(CSS_INJECT_FUNCTION) + n + 4);
   if (esc == NULL) {
     return -1;
   }
-  char *js = (char *)calloc(1, n);
+  js = (char *)calloc(1, n);
   webview_js_encode(css, js, n);
   snprintf(esc, sizeof(CSS_INJECT_FUNCTION) + n + 4, "%s(\"%s\")",
            CSS_INJECT_FUNCTION, js);
-  int r = webview_eval(w, esc);
+  r = webview_eval(w, esc);
   free(js);
   free(esc);
   return r;
@@ -533,7 +536,13 @@ typedef struct {
 #define iid_unref(x) (x)
 #endif
 
-static inline WCHAR *webview_to_utf16(const char *s) {
+#if !__cplusplus && _MSC_VER // MS C-Compiler does not support 'static inline'
+  #define INLINE
+#else
+  #define INLINE inline
+#endif
+
+static INLINE WCHAR *webview_to_utf16(const char *s) {
   DWORD size = MultiByteToWideChar(CP_UTF8, 0, s, -1, 0, 0);
   WCHAR *ws = (WCHAR *)GlobalAlloc(GMEM_FIXED, sizeof(WCHAR) * size);
   if (ws == NULL) {
@@ -543,7 +552,7 @@ static inline WCHAR *webview_to_utf16(const char *s) {
   return ws;
 }
 
-static inline char *webview_from_utf16(WCHAR *ws) {
+static INLINE char *webview_from_utf16(WCHAR *ws) {
   int n = WideCharToMultiByte(CP_UTF8, 0, ws, -1, NULL, 0, NULL, NULL);
   char *s = (char *)GlobalAlloc(GMEM_FIXED, n);
   if (s == NULL) {
@@ -1101,6 +1110,11 @@ error:
 
 #define WEBVIEW_DATA_URL_PREFIX "data:text/html,"
 static int DisplayHTMLPage(struct webview *w) {
+  const char *p;
+  char *url;
+  char *q;
+  int isDataURL;
+  const char *webview_url;
   IWebBrowser2 *webBrowser2;
   VARIANT myURL;
   LPDISPATCH lpDispatch;
@@ -1110,8 +1124,8 @@ static int DisplayHTMLPage(struct webview *w) {
   SAFEARRAY *sfArray;
   VARIANT *pVar;
   browserObject = *w->priv.browser;
-  int isDataURL = 0;
-  const char *webview_url = webview_check_url(w->url);
+  isDataURL = 0;
+  webview_url = webview_check_url(w->url);
   if (!browserObject->lpVtbl->QueryInterface(
           browserObject, iid_unref(&IID_IWebBrowser2), (void **)&webBrowser2)) {
     LPCSTR webPageName;
@@ -1147,9 +1161,9 @@ static int DisplayHTMLPage(struct webview *w) {
       return 0;
     }
 
-    char *url = (char *)calloc(1, strlen(webview_url) + 1);
-    char *q = url;
-    for (const char *p = webview_url + strlen(WEBVIEW_DATA_URL_PREFIX); *q = *p;
+    url = (char *)calloc(1, strlen(webview_url) + 1);
+    q = url;
+    for (p = webview_url + strlen(WEBVIEW_DATA_URL_PREFIX); *q = *p;
          p++, q++) {
       if (*q == '%' && *(p + 1) && *(p + 2)) {
         sscanf(p + 1, "%02x", q);
@@ -1264,6 +1278,7 @@ WEBVIEW_API int webview_init(struct webview *w) {
   DWORD style;
   RECT clientRect;
   RECT rect;
+  int left, top;
 
   if (webview_fix_ie_compat_mode() < 0) {
     return -1;
@@ -1295,8 +1310,8 @@ WEBVIEW_API int webview_init(struct webview *w) {
   AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, 0);
 
   GetClientRect(GetDesktopWindow(), &clientRect);
-  int left = (clientRect.right / 2) - ((rect.right - rect.left) / 2);
-  int top = (clientRect.bottom / 2) - ((rect.bottom - rect.top) / 2);
+  left = (clientRect.right / 2) - ((rect.right - rect.left) / 2);
+  top = (clientRect.bottom / 2) - ((rect.bottom - rect.top) / 2);
   rect.right = rect.right - rect.left + left;
   rect.left = left;
   rect.bottom = rect.bottom - rect.top + top;
@@ -1366,6 +1381,19 @@ WEBVIEW_API int webview_eval(struct webview *w, const char *js) {
   IHTMLDocument2 *htmlDoc2;
   IDispatch *docDispatch;
   IDispatch *scriptDispatch;
+  DISPID dispid;
+  DISPPARAMS params;
+  VARIANT arg;
+  VARIANT result;
+  EXCEPINFO excepInfo;
+  UINT nArgErr;
+  BSTR evalStr;
+  size_t n;
+  char *eval;
+  wchar_t *buf;
+  static const char *prologue = "(function(){";
+  static const char *epilogue = ";})();";
+  
   if ((*w->priv.browser)
           ->lpVtbl->QueryInterface((*w->priv.browser),
                                    iid_unref(&IID_IWebBrowser2),
@@ -1384,8 +1412,8 @@ WEBVIEW_API int webview_eval(struct webview *w, const char *js) {
   if (htmlDoc2->lpVtbl->get_Script(htmlDoc2, &scriptDispatch) != S_OK) {
     return -1;
   }
-  DISPID dispid;
-  BSTR evalStr = SysAllocString(L"eval");
+  
+  evalStr = SysAllocString(L"eval");
   if (scriptDispatch->lpVtbl->GetIDsOfNames(
           scriptDispatch, iid_unref(&IID_NULL), &evalStr, 1,
           LOCALE_SYSTEM_DEFAULT, &dispid) != S_OK) {
@@ -1394,21 +1422,15 @@ WEBVIEW_API int webview_eval(struct webview *w, const char *js) {
   }
   SysFreeString(evalStr);
 
-  DISPPARAMS params;
-  VARIANT arg;
-  VARIANT result;
-  EXCEPINFO excepInfo;
-  UINT nArgErr = (UINT)-1;
+  nArgErr = (UINT)-1;
   params.cArgs = 1;
   params.cNamedArgs = 0;
   params.rgvarg = &arg;
   arg.vt = VT_BSTR;
-  static const char *prologue = "(function(){";
-  static const char *epilogue = ";})();";
-  int n = strlen(prologue) + strlen(epilogue) + strlen(js) + 1;
-  char *eval = (char *)malloc(n);
+  n = strlen(prologue) + strlen(epilogue) + strlen(js) + 1;
+  eval = (char *)malloc(n);
   snprintf(eval, n, "%s%s%s", prologue, js, epilogue);
-  wchar_t *buf = webview_to_utf16(eval);
+  buf = webview_to_utf16(eval);
   if (buf == NULL) {
     return -1;
   }
@@ -1436,6 +1458,8 @@ WEBVIEW_API void webview_set_title(struct webview *w, const char *title) {
 }
 
 WEBVIEW_API void webview_set_fullscreen(struct webview *w, int fullscreen) {
+  RECT r;
+
   if (w->priv.is_fullscreen == !!fullscreen) {
     return;
   }
@@ -1456,7 +1480,6 @@ WEBVIEW_API void webview_set_fullscreen(struct webview *w, int fullscreen) {
     monitor_info.cbSize = sizeof(monitor_info);
     GetMonitorInfo(MonitorFromWindow(w->priv.hwnd, MONITOR_DEFAULTTONEAREST),
                    &monitor_info);
-    RECT r;
     r.left = monitor_info.rcMonitor.left;
     r.top = monitor_info.rcMonitor.top;
     r.right = monitor_info.rcMonitor.right;
